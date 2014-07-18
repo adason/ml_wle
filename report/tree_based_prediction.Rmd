@@ -1,0 +1,227 @@
+---
+title: "Tree Based Predictions on Weight Lifting Exercise Dataset"
+author: "You-Cyuan Jhang"
+date: "June 17, 2014"
+output: html_document
+---
+## Objective
+
+Predict different types of weight lifting exercises in Weight Lifting Exercises Dataset using Random Forest and Stochastic Gradient Boosting methods. Prediction performaces are compared to logistic regression with L1/L2 regualrizations.
+
+## Data Processing
+
+### Setup R Enviroment
+
+First, setup the folder and load the reqired packages. In this report, I will use `data.table` to perform data cleanup. Use `caret` package for maching learning prediction. The `caret` package has a lot of wrapper for maching learning algorithms in R. See [Caret](http://caret.r-forge.r-project.org) and [data.table](http://datatable.r-forge.r-project.org) for more detail.
+
+```{r load_library, results = 'hide', message = FALSE}
+library(caret)
+library(plyr)
+library(data.table)
+library(randomForest)
+library(gbm)
+library(glmnet)
+project_dir <- "~/Dropbox/Course/2014/Coursera_Practical_Machine_Learning/weight_lifting"
+```
+
+### Obtain Original Dataset
+
+Download the dataset if file not exist. 
+
+```{r file_download, cache = TRUE}
+file_url_train <- "http://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+file_url_test <- "http://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+file_name_train <- paste0(project_dir, "/data/original/pml-training.csv")
+file_name_test <-  paste0(project_dir, "/data/original/pml-testing.csv")
+if ( !file.exists(file_name_train) ) {
+  dir.create(paste(project_dir, "data/original", sep = "/"))
+  download.file(file_url_train, file_name_train)
+}
+if ( !file.exists(file_name_test) ) {
+  download.file(file_url_test, file_name_test)
+}
+```
+
+Read the weight lifting dataset. The section in file `pml-training.csv` will be use to build machine learning model. I will then use the best model to predict the testing section given in file `pml-testing.csv`. 
+
+```{r read_data, cache = TRUE}
+nastrings <- c("NA","#DIV/0!","")
+wle_data <- fread(paste0(project_dir, "/data/original/pml-training.csv"), na.strings = nastrings)
+wle_submission <- fread(paste0(project_dir, "/data/original/pml-testing.csv"), na.strings = nastrings)
+```
+
+According to the [paper](http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf) which describes this dataset, they use a sliding window approach to detect and separate each movement measurements. Then the statistcs (mean, variance, skiness..) of measuremets in this window are calculated and stored in rows with `new_window: yes` value. Therefore, my first step is to filter out these records from the original dataset, followed by steps removing unrevelent `time stamp`, `record_id`, `new_window`, `num_window` and `user_name` features.
+
+```{r collect_window, cache = TRUE}
+wle_data <- wle_data[new_window == "yes",]
+wle_data <- wle_data[, c("V1", "raw_timestamp_part_1", "raw_timestamp_part_2", "cvtd_timestamp", "new_window", "num_window", "user_name") := NULL]
+# Convert should be numeric columns to numeric
+wle_data <- wle_data[,lapply(.SD, as.numeric), by=c("classe")]
+```
+
+This is the raw data for this study.
+
+### Training-Testing Split
+
+In order to build a machine leraning model and verify my model, I take the dataset and spit into two parts, with 70% for training and 30% for testing. This is processed through `createDataPartition()` function in `caret` package.
+
+```{r train_test_split, cache = TRUE}
+set.seed(98736)
+train_indices <- createDataPartition(wle_data$classe, p = 0.7)
+wle_training <- wle_data[train_indices$Resample1]
+wle_testing <- wle_data[-train_indices$Resample1]
+```
+
+The section `wle_training` will be used to build different models and evaluate preformace using cross-validation. The section `wle_testing` are used as an separate dataset for prediction evaluation.
+
+### Preprocess
+
+Before building machine learning model, I applied the dataset preprocessing step in the following order:
+
+1. Some of the columns are zero or has near zero values. These features will not be effective when building machine learning models. Here I remove nearzero columns using `nearZeroVar()` function in `caret`.
+
+2. Perform Box-Cox transformation to stabilize variance and make the data more normal distribution-like. Followed by centering and scaling to make the data close to standard normal distribution.
+
+3. Some columns come with value `#DIV/0!` from the original dataset. This is because when computing the statictics in each window, some of the values are missing or zero. I already replace these values with `NA` when reading the original dataset. Here I use the **K Nearest Neighbors** imputation method in `caret` package to fill these missing values. 
+
+4. Finally, Principle Component Analysis are applied. The new fearute variables will have 95% of the variance explained.
+
+```{r preprocess, cache = TRUE}
+# 1. Detect nearzero columns and remove them
+wle_nearzero <- nearZeroVar(wle_training, saveMetrics = TRUE)
+wle_training <- wle_training[,!wle_nearzero$nzv, with = FALSE]
+wle_testing <- wle_testing[,!wle_nearzero$nzv, with = FALSE]
+
+# separate y columns
+wle_training_y <- as.factor(wle_training$classe)
+wle_testing_y <- as.factor(wle_testing$classe)
+wle_training <- wle_training[, -1, with = FALSE]
+wle_testing <- wle_testing[,-1, with = FALSE]
+
+# 2-4: BoxCox, Center, Scale Impute and PCA
+# Impute missing values using k-nearest-neighbors with k = 5
+# (Ignore first column since is our outcome variable and it's not numeric)
+preprocess_model <- preProcess(wle_training, method = c("BoxCox", "center", "scale", "knnImpute", "pca"), thresh = 0.95, k = 5)
+wle_training <- predict(preprocess_model, newdata = wle_training)
+wle_testing <- predict(preprocess_model, newdata = wle_testing)
+```
+
+After the preprocess step, there are `r preprocess_model$numComp` principle components. These compinents are my new features used to build different machine learning models.
+
+## Machine Learning Predictions
+
+After the preprocess step, now let's use the training set to build an prediction model. In this section, three different models are compared, which are Random Forest (Bagging) method, Stochastic Gradient Boosting method and logistic regression methods with L1/L2 regularizations. For each model, I applied `5-fold` cross-validation with `5` rpepetations on the training dataset using different tuning parameters for each model. The model with the highest accuracy are chosen as my final model.
+
+### Random Forest
+
+Random forest models are presented in this section. The result averages over `500` different random trees grown for each tuning parameter. The only tuning parameter in this model is `mtry`, which represents the number of variables randomly sampled as candidates at each split. The range from `3` to `10`.
+
+```{r rf, cache = TRUE}
+rf_ctrl <- trainControl(method = "repeatedcv", number = 5, repeats = 5)
+rf_grid <- expand.grid(mtry = 3:10)
+rf_model <- train(wle_training, wle_training_y, method = "rf", trControl = rf_ctrl, tuneGrid = rf_grid, metric = "Accuracy")
+```
+
+After Training, show the best models in terms of accuracy in these 5 repeated 5-fold cross-validations.
+
+```{r rf_summary}
+ggplot(rf_model)
+rf_testing_y <- predict(rf_model, newdata = wle_testing)
+rf_cf <- confusionMatrix(rf_testing_y, wle_testing_y)
+```
+
+Result of the best model on testing dataset:
+
+Contingency table:
+```{r rf_cf_table, echo = FALSE}
+rf_cf$table
+```
+
+Overall Accuracy: 
+```{r rf_acc, echo = FALSE} 
+rf_cf$overall[1]
+```
+
+### Stochastic Gradient Boosting
+
+Stochastic Gradient Boosting method is applied in this section. The tuning parameter `interaction.depth` represents the maximum depth of variable interactions. 1 implies an additive model, 2 implies a model with up to 2-way interactions, etc. Here interaction.dapth ranges from `3` to `6` are chosen. The total number of trees `n.tree` are chosen to range from `30` to `900`, with `30` increment. A shrinkage parameter `shrinkage` with value `0.2` are applied to each tree in the expansion to prevent over-fitting problem.
+
+```{r gbm, cache = TRUE}
+gbm_ctrl <- trainControl(method = "repeatedcv", number = 5, repeats = 5)
+gbm_grid <- expand.grid(interaction.depth = c(3, 4, 5, 6), n.trees = 1:30*30, shrinkage = 0.2)
+gbm_model <- train(wle_training, wle_training_y, method = "gbm", trControl = gbm_ctrl, tuneGrid = gbm_grid, metric = "Accuracy", verbose = FALSE)
+```
+
+After Training, show the best models in terms of accuracy in these 5 repeated 5-fold cross-validations.
+
+```{r gbm_summary}
+ggplot(gbm_model)
+gbm_testing_y <- predict(gbm_model, newdata = wle_testing)
+gbm_cf <- confusionMatrix(gbm_testing_y, wle_testing_y)
+```
+
+Result of the best model on testing dataset:
+
+Contingency table:
+```{r gbm_cf_table, echo = FALSE}
+gbm_cf$table
+```
+
+Overall Accuracy: 
+```{r gbm_acc, echo = FALSE} 
+gbm_cf$overall[1]
+```
+
+### Multi-class Logistic Regression with L1/L2 mixed Regularization
+
+Generalized linear models via penalized maximum likelihood are applied in this section. Here I choose to use the `glmnet` package in `caret`. The tuning parameter `lambda` ranges from $10^{-3}$ to $10^{-1}$. The alpah value shows a mixture of L1 regularization (`lasso`, `alpha = 1`) and L2 regularization (`ridge`, `alpha = 0`) and elastic net mixture at `alpha = 0.5`.
+
+```{r glmnet, cache = TRUE, warning = FALSE}
+glmnet_ctrl <- trainControl(method = "repeatedcv", number = 5, repeats = 5)
+glmnet_grid <- expand.grid(lambda = 10^(seq(-3,-1,0.1)), alpha = c(0.0, 0.5, 1.0))
+glmnet_model <- train(wle_training, wle_training_y, method = "glmnet", trControl = glmnet_ctrl, tuneGrid = glmnet_grid, metric = "Accuracy", family = c("multinomial"))
+```
+
+After Training, show the best models in terms of accuracy in these 5 repeated 5-fold cross-validations.
+
+```{r glmnet_summary}
+ggplot(glmnet_model) + scale_x_log10()
+glmnet_testing_y <- predict(glmnet_model, newdata = wle_testing)
+glmnet_cf <- confusionMatrix(glmnet_testing_y, wle_testing_y)
+```
+
+Result of the best model on testing dataset:
+
+Contingency table:
+```{r glmnet_cf_table, echo = FALSE}
+glmnet_cf$table
+```
+
+Overall Accuracy: 
+```{r glmnet_acc, echo = FALSE} 
+glmnet_cf$overall[1]
+```
+
+### Choices and Submission
+
+According the the overall accuracy and confusion matrix, I choose the best model of random forest. This best model is applied to the testing dataset to make submission file.
+
+```{r make_submission}
+wle_submission <- wle_submission[, c("V1", "raw_timestamp_part_1", "raw_timestamp_part_2", "cvtd_timestamp", "new_window", "num_window", "user_name") := NULL]
+wle_submission <- wle_submission[,lapply(.SD, as.numeric), by = c("problem_id")]
+wle_submission <- wle_submission[,!wle_nearzero$nzv, with = FALSE]
+wle_submission_id <- wle_submission$problem_id
+wle_submission <- predict(preprocess_model, newdata = wle_submission[, -1, with = FALSE])
+wle_submission_y <- predict(rf_model, newdata = wle_submission)
+```
+
+```{r save_submission, echo = FALSE}
+dir.create("tree_based_prediction_submission", showWarnings = FALSE)
+for (i in wle_submission_id){
+  write(as.character(wle_submission_y[i]), file = paste0("tree_based_prediction_submission/", i))
+}
+```
+
+## Summary
+
+Three different machine learning models are compared. In this particular dataset, random forest model yiels the best prediction accuracy. The prediction parameters must be carefully tuned using cross-validation method. We might need more complicated model to improve prediction accuracy.
