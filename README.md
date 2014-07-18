@@ -13,3 +13,6 @@ Read more: http://groupware.les.inf.puc-rio.br/har#ixzz34w1QtayW
 - [Testing](http://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv)
 
 The data for this project come from this source: http://groupware.les.inf.puc-rio.br/har. If you use the document you create for this class for any purpose please cite them as they have been very generous in allowing their data to be used for this kind of assignment.
+
+### Report ###
+[link](http://adason.github.io/ml_wle/report.html)
