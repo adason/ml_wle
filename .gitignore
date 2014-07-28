@@ -47,3 +47,6 @@ Thumbs.db
 
 # For this Project   #
 ######################
+data/
+report/*_cache
+report/*_files

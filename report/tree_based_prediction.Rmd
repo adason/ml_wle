@@ -1,60 +1,66 @@
 ---
-title: "Tree Based Predictions on Weight Lifting Exercise Dataset"
+title: "Predictions on Lifting Exercises"
 author: "You-Cyuan Jhang"
-date: "June 17, 2014"
-output: html_document
+output: 
+  html_document:
+    theme: "spacelab"
 ---
-## Objective
 
-Predict different types of weight lifting exercises in Weight Lifting Exercises Dataset using Random Forest and Stochastic Gradient Boosting methods. Prediction performaces are compared to logistic regression with L1/L2 regualrizations.
+Introduction
+------------
 
-## Data Processing
+This report is based on the course project of [Practical Machine Learning](https://www.coursera.org/course/predmachlearn), which is part of the [Coursera Data Science Specialization](https://www.coursera.org/specialization/jhudatascience/1). In this project, students are asked to use the [Weight Lifting Exercise Dataset](http://groupware.les.inf.puc-rio.br/har) to recognize different types of exercises and predict whether the subject is performing their exercise correctly. In this report, I will present three different types of machine learning methods, which are Logistic Regressions (with L1/L2 regualrizations), Random Forest and Stochastic Gradient Boosting methods. Their performace are compared at the end of this report.
 
-### Setup R Enviroment
+About this Dataset
+-----------------
 
-First, setup the folder and load the reqired packages. In this report, I will use `data.table` to perform data cleanup. Use `caret` package for maching learning prediction. The `caret` package has a lot of wrapper for maching learning algorithms in R. See [Caret](http://caret.r-forge.r-project.org) and [data.table](http://datatable.r-forge.r-project.org) for more detail.
+This dataset contains barbell lifing exercise measurements from accelerometers placed on the belt, forearm, arm, and dumbell. A total of 6 young, healthy participants were asked to perform lifts correctly and incorrectly in 5 different ways. Each participants performed one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl in five different fashions: exactly according to the specification (Class A), throwing the elbows to the front (Class B), lifting the dumbbell only halfway (Class C), lowering the dumbbell only halfway (Class D) and throwing the hips to the front (Class E). Class A corresponds to the specified execution of the exercise, while the other 4 classes correspond to common mistakes.
 
-```{r load_library, results = 'hide', message = FALSE}
-library(caret)
-library(plyr)
-library(data.table)
-library(randomForest)
-library(gbm)
-library(glmnet)
-project_dir <- "~/Dropbox/Course/2014/Coursera_Practical_Machine_Learning/weight_lifting"
+The dataset can be downloaded [here](http://groupware.les.inf.puc-rio.br/static/WLE/WearableComputing_weight_lifting_exercises_biceps_curl_variations.csv). This `csv` file contaions original time-Series data of the 4 accelerometers. Some rows are the measurement statics processed from the raw time series data using sliding window approach to detect and separate 10 repetitive measurements. The statistcs (mean, variance, skiness..) in each window are calculated and stored in rows specified as `new_window: yes`. In this report, I will focus on these measurement statistics to recognize different exercise execution.
+
+More informations are available from their [website](http://groupware.les.inf.puc-rio.br/har) (see the section on the Weight Lifting Exercise Dataset) and their [paper](http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf).
+
+Data Processing
+---------------
+
+This section presents r enviroment setup, obtain original dataset and training-testing data split.
+
+### Enviroment Setup
+
+```{r load_library, results='hide', message=FALSE}
+library(data.table)  # efficient data processing tool
+library(caret)  # common maching learning tasks
+library(randomForest)  # Random Forest
+library(gbm)  # Stochastic Gradient Boosting
+library(glmnet)  # Logistic Regression with Regularizations
 ```
 
-### Obtain Original Dataset
+### Download Dataset 
 
-Download the dataset if file not exist. 
-
-```{r file_download, cache = TRUE}
-file_url_train <- "http://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
-file_url_test <- "http://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
-file_name_train <- paste0(project_dir, "/data/original/pml-training.csv")
-file_name_test <-  paste0(project_dir, "/data/original/pml-testing.csv")
-if ( !file.exists(file_name_train) ) {
-  dir.create(paste(project_dir, "data/original", sep = "/"))
-  download.file(file_url_train, file_name_train)
+```{r file_download, cache=TRUE}
+csv_url <- "http://groupware.les.inf.puc-rio.br/static/WLE/WearableComputing_weight_lifting_exercises_biceps_curl_variations.csv"
+csv_filename <- "../data/original/wle_data.csv"
+# download if file not exist.
+if ( !file.exists(csv_filename) ) {
+  dir.create("../data/original", recursive=TRUE)
+  download.file(csv_url, csv_filename)
 }
-if ( !file.exists(file_name_test) ) {
-  download.file(file_url_test, file_name_test)
-}
 ```
 
-Read the weight lifting dataset. The section in file `pml-training.csv` will be use to build machine learning model. I will then use the best model to predict the testing section given in file `pml-testing.csv`. 
+### Read Data
 
-```{r read_data, cache = TRUE}
-nastrings <- c("NA","#DIV/0!","")
-wle_data <- fread(paste0(project_dir, "/data/original/pml-training.csv"), na.strings = nastrings)
-wle_submission <- fread(paste0(project_dir, "/data/original/pml-testing.csv"), na.strings = nastrings)
+Read the weight lifting dataset using `fread()` function from `data.table`. In the original dataset, `NA` string are represented as `NA` or just an empty string `""`. When measurement statistics within a sliding window produces a diver, they are represented as `"#DIV/0!"`, which is also treated as missing values in this case.
+
+```{r read_data, cache=TRUE, results='hide', message=FALSE, warning=FALSE}
+nastrings <- c("NA","#DIV/0!","", " ")
+wle_data <- fread(csv_filename, na.strings=nastrings)
 ```
 
-According to the [paper](http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf) which describes this dataset, they use a sliding window approach to detect and separate each movement measurements. Then the statistcs (mean, variance, skiness..) of measuremets in this window are calculated and stored in rows with `new_window: yes` value. Therefore, my first step is to filter out these records from the original dataset, followed by steps removing unrevelent `time stamp`, `record_id`, `new_window`, `num_window` and `user_name` features.
+Keep rows with `new_window: yes` only. Also remove unrevelent columns, such as `time stamp`, `record_id`, `new_window`, `num_window` and `user_name`.
 
 ```{r collect_window, cache = TRUE}
 wle_data <- wle_data[new_window == "yes",]
-wle_data <- wle_data[, c("V1", "raw_timestamp_part_1", "raw_timestamp_part_2", "cvtd_timestamp", "new_window", "num_window", "user_name") := NULL]
+wle_data <- wle_data[, c("raw_timestamp_part_1", "raw_timestamp_part_2", "cvtd_timestamp", "new_window", "num_window", "user_name") := NULL]
 # Convert should be numeric columns to numeric
 wle_data <- wle_data[,lapply(.SD, as.numeric), by=c("classe")]
 ```
@@ -200,26 +206,6 @@ glmnet_cf$table
 Overall Accuracy: 
 ```{r glmnet_acc, echo = FALSE} 
 glmnet_cf$overall[1]
-```
-
-### Choices and Submission
-
-According the the overall accuracy and confusion matrix, I choose the best model of random forest. This best model is applied to the testing dataset to make submission file.
-
-```{r make_submission}
-wle_submission <- wle_submission[, c("V1", "raw_timestamp_part_1", "raw_timestamp_part_2", "cvtd_timestamp", "new_window", "num_window", "user_name") := NULL]
-wle_submission <- wle_submission[,lapply(.SD, as.numeric), by = c("problem_id")]
-wle_submission <- wle_submission[,!wle_nearzero$nzv, with = FALSE]
-wle_submission_id <- wle_submission$problem_id
-wle_submission <- predict(preprocess_model, newdata = wle_submission[, -1, with = FALSE])
-wle_submission_y <- predict(rf_model, newdata = wle_submission)
-```
-
-```{r save_submission, echo = FALSE}
-dir.create("tree_based_prediction_submission", showWarnings = FALSE)
-for (i in wle_submission_id){
-  write(as.character(wle_submission_y[i]), file = paste0("tree_based_prediction_submission/", i))
-}
 ```
 
 ## Summary
